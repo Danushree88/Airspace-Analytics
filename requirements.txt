@@ -1,4 +1,5 @@
-kafka-python-ng
-requests==2.31.0
-pandas==2.2.2
-numpy==1.26.4
+kafka-python
+requests
+pyspark==3.4.0
+cassandra-driver
+pandas
