@@ -1,3 +1,5 @@
+version: '3.8'
+
 services:
 
   zookeeper:
@@ -20,17 +22,33 @@ services:
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
 
   cassandra:
-    image: cassandra:5.0
+    image: cassandra:4.0
+    container_name: cassandra
     ports:
       - "9042:9042"
+    volumes:
+      - cassandra_data:/var/lib/cassandra
+    environment:
+      - CASSANDRA_CLUSTER_NAME=airspace_cluster
 
-  spark:
-    image: bitnami/spark:3.4
-    container_name: spark
+  spark-master:
+    image: spark:3.5.7
+    container_name: spark-master
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
     ports:
-      - "4040:4040"
+      - "7077:7077"
+      - "8080:8080"
     volumes:
       - ../spark:/opt/spark-apps
-    environment:
-      - SPARK_MODE=master
-    command: tail -f /dev/null
+
+  spark-worker:
+    image: spark:3.5.7
+    container_name: spark-worker
+    depends_on:
+      - spark-master
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    volumes:
+      - ../spark:/opt/spark-apps
+
+volumes:
+  cassandra_data:
