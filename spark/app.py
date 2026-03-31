@@ -2,6 +2,15 @@ from pyspark.sql import SparkSession
 from pyspark.sql.functions import *
 from pyspark.sql.types import *
 
+from ml.anomaly import AnomalyDetector
+from ml.clustering import FlightClustering
+
+# -----------------------------------
+# ML MODELS (GLOBAL)
+# -----------------------------------
+anomaly_model = AnomalyDetector()
+cluster_model = FlightClustering()
+
 # -----------------------------------
 # 1. Spark Session
 # -----------------------------------
@@ -43,7 +52,7 @@ df = df_kafka.selectExpr("CAST(value AS STRING)") \
     .select("data.*")
 
 # -----------------------------------
-# 4. Data Cleaning + Validation
+# 4. Data Cleaning
 # -----------------------------------
 df_clean = df.filter(
     (col("latitude").isNotNull()) &
@@ -81,7 +90,7 @@ df_feat = df_clean \
     )
 
 # -----------------------------------
-# 6. Load Airports Dataset
+# 6. Airports Dataset
 # -----------------------------------
 df_airports = spark.read \
     .option("header", True) \
@@ -106,7 +115,7 @@ df_joined = df_feat.join(
 )
 
 # -----------------------------------
-# 8. Capacity Assignment
+# 8. Capacity
 # -----------------------------------
 df_joined = df_joined.withColumn(
     "base_capacity",
@@ -117,7 +126,7 @@ df_joined = df_joined.withColumn(
 )
 
 # -----------------------------------
-# 9. Weather Factor
+# 9. Weather
 # -----------------------------------
 df_joined = df_joined.withColumn(
     "weather_factor",
@@ -151,42 +160,13 @@ df_final = df_final.withColumn(
 )
 
 # -----------------------------------
-# 13. ACI Aggregation
-# -----------------------------------
-aci_stream = df_final \
-    .withWatermark("event_time", "1 minute") \
-    .groupBy(
-        window(col("event_time"), "1 minute"),
-        col("region")
-    ) \
-    .agg(
-        count("*").alias("aircraft_count"),
-        avg("effective_capacity").alias("capacity")
-    ) \
-    .withColumn(
-        "aci",
-        when(col("capacity") > 0,
-             col("aircraft_count") / col("capacity"))
-        .otherwise(0)
-    ) \
-    .select(
-        col("region"),
-        col("window.start").alias("timestamp"),
-        col("aircraft_count"),
-        col("capacity"),
-        col("aci")
-    )
-
-# -----------------------------------
-# 14. RDD Processing (BEST VERSION)
+# 13. PROCESS BATCH (CORE)
 # -----------------------------------
 def process_batch(batch_df, batch_id):
 
     print(f"\n===== Batch {batch_id} =====")
 
-    # -----------------------------------
-    # 1. RDD: Aircraft Count per Region
-    # -----------------------------------
+    # ---------------- RDD ----------------
     region_counts_rdd = (
         batch_df.select("region").rdd
         .map(lambda x: (x["region"], 1))
@@ -195,9 +175,6 @@ def process_batch(batch_df, batch_id):
 
     print("Top Regions:", region_counts_rdd.takeOrdered(5, key=lambda x: -x[1]))
 
-    # -----------------------------------
-    # 2. RDD: Avg Speed per Region
-    # -----------------------------------
     avg_speed_rdd = (
         batch_df.select("region", "speed_kmh").rdd
         .map(lambda x: (x["region"], (x["speed_kmh"], 1)))
@@ -207,68 +184,112 @@ def process_batch(batch_df, batch_id):
 
     print("Avg Speed:", avg_speed_rdd.take(5))
 
-    # -----------------------------------
-    # 3. SQL Analytics
-    # -----------------------------------
-    batch_df.createOrReplaceTempView("flights")
+    # ---------------- SQL ----------------
+    batch_df.createOrReplaceGlobalTempView("flights")
 
     flights_country = spark.sql("""
         SELECT country, COUNT(*) AS total_flights
-        FROM flights
+        FROM global_temp.flights
         GROUP BY country
         ORDER BY total_flights DESC
     """)
 
     altitude_country = spark.sql("""
         SELECT country, AVG(altitude) AS avg_altitude
-        FROM flights
+        FROM global_temp.flights
         GROUP BY country
     """)
 
-    # -----------------------------------
-    # 4. COUNTRY METRICS
-    # -----------------------------------
     country_metrics = flights_country.join(
         altitude_country, "country"
     ).withColumn(
-        "traffic_density",
-        col("total_flights") / 100.0
+        "traffic_density", col("total_flights") / 100.0
     ).withColumn(
-        "timestamp",
-        current_timestamp()
+        "timestamp", current_timestamp()
     )
 
-    # -----------------------------------
-    # 5. REGION METRICS (ACI)
-    # -----------------------------------
     region_metrics = batch_df.groupBy("region").agg(
         count("*").alias("aircraft_count"),
         avg("effective_capacity").alias("capacity")
     ).withColumn(
-        "aci",
-        col("aircraft_count") / col("capacity")
+        "aci", col("aircraft_count") / col("capacity")
     ).withColumn(
-        "timestamp",
-        current_timestamp()
+        "timestamp", current_timestamp()
     )
 
-    # -----------------------------------
-    # 6. WRITE TO CASSANDRA
-    # -----------------------------------
-    region_metrics.write \
-        .format("org.apache.spark.sql.cassandra") \
+    # ---------------- ML ----------------
+    ml_df = batch_df.select(
+        "icao24", "speed_kmh", "altitude", "vertical_rate"
+    ).dropna()
+
+    if ml_df.count() > 10:
+        pdf = ml_df.toPandas()
+
+        anomalies_pdf = anomaly_model.detect(pdf)
+
+        if not anomalies_pdf.empty:
+            anomalies_spark = spark.createDataFrame(anomalies_pdf)
+
+            anomalies_spark.withColumn(
+                "timestamp", current_timestamp()
+            ).withColumn(
+                "reason", lit("IsolationForest anomaly")
+            ).write \
+                .format("org.apache.spark.sql.cassandra") \
+                .mode("append") \
+                .options(table="anomaly_logs", keyspace="airspace") \
+                .save()
+
+        cluster_model.cluster(pdf)
+
+    # ---------------- ALERTS ----------------
+    alerts_df = region_metrics.withColumn(
+        "alert",
+        when(col("aci") > 1.2, "HIGH_CONGESTION")
+        .when(col("aci") > 0.8, "MEDIUM_CONGESTION")
+    ).filter(col("alert").isNotNull())
+
+    alerts_df = alerts_df.withColumn("timestamp", current_timestamp())
+
+    # ---------------- WRITES ----------------
+    batch_df.select(
+        col("icao24"),
+        col("event_time").alias("timestamp"),
+        col("altitude"),
+        col("callsign"),
+        col("country"),
+        col("latitude"),
+        col("longitude"),
+        col("velocity"),
+        col("vertical_rate")
+    ).write.format("org.apache.spark.sql.cassandra") \
+     .mode("append") \
+     .options(table="flight_events", keyspace="airspace") \
+     .save()
+
+    region_metrics.write.format("org.apache.spark.sql.cassandra") \
         .mode("append") \
         .options(table="region_metrics", keyspace="airspace") \
         .save()
 
-    country_metrics.write \
-        .format("org.apache.spark.sql.cassandra") \
+    country_metrics.write.format("org.apache.spark.sql.cassandra") \
         .mode("append") \
         .options(table="country_metrics", keyspace="airspace") \
         .save()
 
+    # ✅ FINAL ALERT WRITE (THIS WAS MISSING)
+    alerts_df.select(
+        col("region"),
+        col("timestamp"),
+        col("alert").alias("alert_type")
+    ).write.format("org.apache.spark.sql.cassandra") \
+     .mode("append") \
+     .options(table="alerts", keyspace="airspace") \
+     .save()
+
+
 # -----------------------------------
-# 15. Streaming Write
+# 14. STREAM START
 # -----------------------------------
 query = df_final.writeStream \
     .outputMode("append") \
