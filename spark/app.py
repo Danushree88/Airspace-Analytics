@@ -228,8 +228,10 @@ def process_batch(batch_df, batch_id):
         anomalies_pdf = anomaly_model.detect(pdf)
 
         if not anomalies_pdf.empty:
-            anomalies_spark = spark.createDataFrame(anomalies_pdf)
-
+            anomalies_pdf["anomaly_score"] = anomalies_pdf["anomaly_score"].astype(float)
+            anomalies_spark = spark.createDataFrame(
+                anomalies_pdf[["icao24", "speed_kmh", "altitude", "vertical_rate", "anomaly_score"]]
+            )
             anomalies_spark.withColumn(
                 "timestamp", current_timestamp()
             ).withColumn(
