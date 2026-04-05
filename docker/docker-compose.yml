@@ -26,10 +26,13 @@ services:
     container_name: cassandra
     ports:
       - "9042:9042"
-    volumes:
-      - cassandra_data:/var/lib/cassandra
     environment:
       - CASSANDRA_CLUSTER_NAME=airspace_cluster
+      - MAX_HEAP_SIZE=512M
+      - HEAP_NEWSIZE=128M
+    mem_limit: 1g
+    volumes:
+      - cassandra_data:/var/lib/cassandra
 
   spark-master:
     build: ./spark
